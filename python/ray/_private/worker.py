@@ -40,7 +40,6 @@ import setproctitle
 from typing import Literal, Protocol
 
 import ray
-import ray._private.worker
 import ray._private.node
 import ray._private.parameter
 import ray._private.profiling as profiling
@@ -427,8 +426,8 @@ class Worker:
         self.mode = None
         self.actors = {}
         # When the worker is constructed. Record the original value of the
-        # (CUDA_VISIBLE_DEVICES, ONEAPI_DEVICE_SELECTOR, ROCR_VISIBLE_DEVICES,
-        # NEURON_RT_VISIBLE_CORES, TPU_VISIBLE_CHIPS, ..) environment variables.
+        # (CUDA_VISIBLE_DEVICES, ONEAPI_DEVICE_SELECTOR, NEURON_RT_VISIBLE_CORES,
+        # TPU_VISIBLE_CHIPS, ..) environment variables.
         self.original_visible_accelerator_ids = (
             ray._private.utils.get_visible_accelerator_ids()
         )
@@ -713,13 +712,7 @@ class Worker:
     def set_load_code_from_local(self, load_code_from_local):
         self._load_code_from_local = load_code_from_local
 
-    def put_object(
-        self,
-        value: Any,
-        object_ref: Optional["ray.ObjectRef"] = None,
-        owner_address: Optional[str] = None,
-        _is_experimental_channel: bool = False,
-    ):
+    def put_object(self, value, object_ref=None, owner_address=None):
         """Put value in the local object store with object reference `object_ref`.
 
         This assumes that the value for `object_ref` has not yet been placed in
@@ -734,10 +727,6 @@ class Worker:
             object_ref: The object ref of the value to be
                 put. If None, one will be generated.
             owner_address: The serialized address of object's owner.
-            _is_experimental_channel: An experimental flag for mutable
-                objects. If True, then the returned object will not have a
-                valid value. The object must be written to using the
-                ray.experimental.channel API before readers can read.
 
         Returns:
             ObjectRef: The object ref the object was put under.
@@ -771,11 +760,6 @@ class Worker:
                 f"{sio.getvalue()}"
             )
             raise TypeError(msg) from e
-
-        # If the object is mutable, then the raylet should never read the
-        # object. Instead, clients will keep the object pinned.
-        pin_object = not _is_experimental_channel
-
         # This *must* be the first place that we construct this python
         # ObjectRef because an entry with 0 local references is created when
         # the object is Put() in the core worker, expecting that this python
@@ -784,11 +768,7 @@ class Worker:
         # reference counter.
         return ray.ObjectRef(
             self.core_worker.put_serialized_object_and_increment_local_ref(
-                serialized_value,
-                object_ref=object_ref,
-                pin_object=pin_object,
-                owner_address=owner_address,
-                _is_experimental_channel=_is_experimental_channel,
+                serialized_value, object_ref=object_ref, owner_address=owner_address
             ),
             # The initial local reference is already acquired internally.
             skip_adding_local_ref=True,
@@ -810,11 +790,7 @@ class Worker:
             context = self.get_serialization_context()
             return context.deserialize_objects(data_metadata_pairs, object_refs)
 
-    def get_objects(
-        self,
-        object_refs: list,
-        timeout: Optional[float] = None,
-    ):
+    def get_objects(self, object_refs: list, timeout: Optional[float] = None):
         """Get the values in the object store associated with the IDs.
 
         Return the values from the local object store for object_refs. This
@@ -841,9 +817,7 @@ class Worker:
 
         timeout_ms = int(timeout * 1000) if timeout is not None else -1
         data_metadata_pairs = self.core_worker.get_objects(
-            object_refs,
-            self.current_task_id,
-            timeout_ms,
+            object_refs, self.current_task_id, timeout_ms
         )
         debugger_breakpoint = b""
         for data, metadata in data_metadata_pairs:
@@ -855,16 +829,10 @@ class Worker:
                     debugger_breakpoint = metadata_fields[1][
                         len(ray_constants.OBJECT_METADATA_DEBUG_PREFIX) :
                     ]
-        values = self.deserialize_objects(data_metadata_pairs, object_refs)
-        for i, value in enumerate(values):
-            if isinstance(value, RayError):
-                if isinstance(value, ray.exceptions.ObjectLostError):
-                    global_worker.core_worker.dump_object_store_memory_usage()
-                if isinstance(value, RayTaskError):
-                    raise value.as_instanceof_cause()
-                else:
-                    raise value
-        return values, debugger_breakpoint
+        return (
+            self.deserialize_objects(data_metadata_pairs, object_refs),
+            debugger_breakpoint,
+        )
 
     def main_loop(self):
         """The main loop a worker runs to receive and execute tasks."""
@@ -960,8 +928,7 @@ class Worker:
         # (CUDA_VISIBLE_DEVICES, ONEAPI_DEVICE_SELECTOR, NEURON_RT_VISIBLE_CORES,
         # TPU_VISIBLE_CHIPS, ..) then respect that in the sense that only IDs
         # that appear in (CUDA_VISIBLE_DEVICES, ONEAPI_DEVICE_SELECTOR,
-        # ROCR_VISIBLE_DEVICES, NEURON_RT_VISIBLE_CORES, TPU_VISIBLE_CHIPS, ..)
-        # should be returned.
+        # NEURON_RT_VISIBLE_CORES, TPU_VISIBLE_CHIPS, ..) should be returned.
         if self.original_visible_accelerator_ids.get(resource_name, None) is not None:
             original_ids = self.original_visible_accelerator_ids[resource_name]
             assigned_ids = {str(original_ids[i]) for i in assigned_ids}
@@ -1161,6 +1128,7 @@ class RayContext(BaseContext, Mapping):
     python_version: str
     ray_version: str
     ray_commit: str
+    protocol_version: Optional[str]
 
     def __init__(self, address_info: Dict[str, Optional[str]]):
         super().__init__()
@@ -1168,6 +1136,9 @@ class RayContext(BaseContext, Mapping):
         self.python_version = "{}.{}.{}".format(*sys.version_info[:3])
         self.ray_version = ray.__version__
         self.ray_commit = ray.__commit__
+        # No client protocol version since this driver was intiialized
+        # directly
+        self.protocol_version = None
         self.address_info = address_info
 
     def __getitem__(self, key):
@@ -1984,6 +1955,7 @@ _worker_logs_enabled = True
 
 
 def print_worker_logs(data: Dict[str, str], print_file: Any):
+
     if not _worker_logs_enabled:
         return
 
@@ -2002,8 +1974,14 @@ def print_worker_logs(data: Dict[str, str], print_file: Any):
     def message_for(data: Dict[str, str], line: str) -> str:
         """The printed message of this log line."""
         if ray_constants.LOG_PREFIX_INFO_MESSAGE in line:
-            return line.split(ray_constants.LOG_PREFIX_INFO_MESSAGE)[1]
-        return line
+            line = line.split(ray_constants.LOG_PREFIX_INFO_MESSAGE)[1]
+        return (
+            line.replace(":light_black:", colorama.Fore.LIGHTBLACK_EX)
+                .replace(":light_red:", colorama.Fore.LIGHTRED_EX)
+                .replace(":light_cyan:", colorama.Fore.LIGHTCYAN_EX)
+                .replace(":light_green:", colorama.Fore.LIGHTGREEN_EX)
+                .replace(":light_yellow:", colorama.Fore.LIGHTYELLOW_EX)
+        )
 
     def color_for(data: Dict[str, str], line: str) -> str:
         """The color for this log line."""
@@ -2056,13 +2034,7 @@ def print_worker_logs(data: Dict[str, str], print_file: Any):
             else:
                 hide_tqdm()
                 print(
-                    "{}({}{}){} {}".format(
-                        color_for(data, line),
-                        prefix_for(data),
-                        pid,
-                        colorama.Style.RESET_ALL,
-                        message_for(data, line),
-                    ),
+                    message_for(data, line),
                     file=print_file,
                 )
     else:
@@ -2677,9 +2649,7 @@ def get(
 @PublicAPI
 @client_mode_hook
 def put(
-    value: Any,
-    *,
-    _owner: Optional["ray.actor.ActorHandle"] = None,
+    value: Any, *, _owner: Optional["ray.actor.ActorHandle"] = None
 ) -> "ray.ObjectRef":
     """Store an object in the object store.
 
